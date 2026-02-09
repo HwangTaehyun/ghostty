@@ -155,9 +155,18 @@ private func cgEventFlagsChangedHandler(
     // We need an NSEvent for our logic below
     guard let event: NSEvent = .init(cgEvent: cgEvent) else { return result }
 
-    // Build our event input and call ghostty
-    let key_ev = event.ghosttyKeyEvent(GHOSTTY_ACTION_PRESS)
-    if ghostty_app_key(ghostty, key_ev) {
+    // Build our event input and call ghostty. We must set the text field
+    // (event.characters) so that the keybinding lookup can match by unicode
+    // codepoint. Without text, only physical key matching works, which fails
+    // for keybindings like "cmd+shift+x" when a non-Latin keyboard layout
+    // (e.g. Korean) is active — the unshifted_codepoint would be 'ㅁ' instead
+    // of 'x', causing the lookup to miss.
+    var key_ev = event.ghosttyKeyEvent(GHOSTTY_ACTION_PRESS)
+    let handled = (event.characters ?? "").withCString { ptr in
+        key_ev.text = ptr
+        return ghostty_app_key(ghostty, key_ev)
+    }
+    if handled {
         GlobalEventTap.logger.info("global key event handled event=\(event, privacy: .public)")
         return nil
     }
