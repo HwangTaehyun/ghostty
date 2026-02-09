@@ -3,6 +3,20 @@ import Cocoa
 import SwiftUI
 import GhosttyKit
 
+// Debug file logger for quick terminal - bypasses macOS privacy filter
+private func qtLog(_ msg: String) {
+    let ts = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+    let line = "[\(ts)] \(msg)\n"
+    let path = "/tmp/ghostty-qt-debug.log"
+    if let handle = FileHandle(forWritingAtPath: path) {
+        handle.seekToEndOfFile()
+        handle.write(line.data(using: .utf8)!)
+        handle.closeFile()
+    } else {
+        FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8))
+    }
+}
+
 /// Controller for the "quick" terminal.
 class QuickTerminalController: BaseTerminalController {
     override var windowNibName: NSNib.Name? { "QuickTerminal" }
@@ -12,6 +26,11 @@ class QuickTerminalController: BaseTerminalController {
 
     /// The current state of the quick terminal
     private(set) var visible: Bool = false
+
+    /// Timestamp of the last animateIn call. Used to prevent auto-hide on
+    /// windowDidResignKey immediately after showing, which happens on fullscreen
+    /// spaces where the fullscreen app reclaims focus instantly.
+    private var lastAnimateInTime: Date? = nil
 
     /// The previously running application when the terminal is shown. This is NEVER Ghostty.
     /// If this is set then when the quick terminal is animated out then we will restore this
@@ -165,7 +184,6 @@ class QuickTerminalController: BaseTerminalController {
 
     override func windowDidResignKey(_ notification: Notification) {
         super.windowDidResignKey(notification)
-
         // If we're not visible then we don't want to run any of the logic below
         // because things like resetting our previous app assume we're visible.
         // windowDidResignKey will also get called after animateOut so this
@@ -175,6 +193,17 @@ class QuickTerminalController: BaseTerminalController {
         // We don't animate out if there is a modal sheet being shown currently.
         // This lets us show alerts without causing the window to disappear.
         guard window?.attachedSheet == nil else { return }
+
+        // In floating mode, ignore resignKey if the window was just shown.
+        // On fullscreen spaces, the fullscreen app immediately reclaims focus
+        // after makeKeyAndOrderFront, causing a spurious resignKey. We use a
+        // grace period to prevent the window from hiding right after appearing.
+        if derivedConfig.quickTerminalFloating,
+           let animateTime = lastAnimateInTime,
+           Date().timeIntervalSince(animateTime) < 1.0 {
+            qtLog("[QT] windowDidResignKey: floating grace period, ignoring")
+            return
+        }
 
         // If our app is still active, then it means that we're switching
         // to another window within our app, so we remove the previous app
@@ -324,6 +353,7 @@ class QuickTerminalController: BaseTerminalController {
     // MARK: Methods
 
     func toggle() {
+        qtLog("[QT] toggle() called, visible=\(visible), isActive=\(NSApp.isActive)")
         if visible {
             animateOut()
         } else {
@@ -332,11 +362,19 @@ class QuickTerminalController: BaseTerminalController {
     }
 
     func animateIn() {
-        guard let window = self.window else { return }
+        guard let window = self.window else {
+            qtLog("[QT] animateIn: no window!")
+            return
+        }
 
         // Set our visibility state
-        guard !visible else { return }
+        guard !visible else {
+            qtLog("[QT] animateIn: already visible, skipping")
+            return
+        }
+        qtLog("[QT] animateIn: starting, floating=\(derivedConfig.quickTerminalFloating)")
         visible = true
+        lastAnimateInTime = Date()
 
         // Notify the change
         NotificationCenter.default.post(
@@ -391,10 +429,20 @@ class QuickTerminalController: BaseTerminalController {
     }
 
     func animateOut() {
-        guard let window = self.window else { return }
-
-        // Set our visibility state
-        guard visible else { return }
+        // Check visibility BEFORE accessing self.window. Accessing self.window
+        // can trigger loadWindow() → windowDidLoad() → animateIn(), which sets
+        // visible=true. If we check window first, this creates a circular
+        // dependency where animateOut triggers animateIn, then continues to
+        // hide the window — causing a visible flicker on first toggle.
+        guard visible else {
+            qtLog("[QT] animateOut: not visible, skipping")
+            return
+        }
+        guard let window = self.window else {
+            qtLog("[QT] animateOut: no window!")
+            return
+        }
+        qtLog("[QT] animateOut: starting")
         visible = false
 
         // Notify the change
@@ -428,6 +476,13 @@ class QuickTerminalController: BaseTerminalController {
         // Grab our last closed frame to use from the cache.
         let closedFrame = screenStateCache.frame(for: screen)
 
+        // For floating mode, set collection behavior BEFORE showing the window
+        // so it can appear on fullscreen spaces. canJoinAllSpaces ensures the
+        // window can reappear on fullscreen spaces.
+        if derivedConfig.quickTerminalFloating {
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        }
+
         // Move our window off screen to the initial animation position.
         position.setInitial(
             in: window,
@@ -435,14 +490,27 @@ class QuickTerminalController: BaseTerminalController {
             terminalSize: derivedConfig.quickTerminalSize,
             closedFrame: closedFrame)
 
-        // We need to set our window level to a high value. In testing, only
-        // popUpMenu and above do what we want. This gets it above the menu bar
-        // and lets us render off screen.
-        window.level = .popUpMenu
+        // We need to set our window level to a high value. For floating mode,
+        // use screenSaver level from the start so the window can appear on
+        // fullscreen spaces even on the first show.
+        if derivedConfig.quickTerminalFloating {
+            window.level = .screenSaver
+        } else {
+            window.level = .popUpMenu
+        }
 
-        // Move it to the visible position since animation requires this
-        DispatchQueue.main.async {
+        // Order the window to front. For floating mode, we call makeKeyAndOrderFront
+        // synchronously (matching iTerm2's approach) so the window is immediately
+        // placed on the current fullscreen space before animation begins.
+        // For non-floating mode, we defer to the next event loop tick.
+        if derivedConfig.quickTerminalFloating {
+            qtLog("[QT] animateWindowIn: SYNC makeKeyAndOrderFront, level=\(window.level.rawValue), behavior=\(window.collectionBehavior.rawValue)")
             window.makeKeyAndOrderFront(nil)
+            qtLog("[QT] animateWindowIn: after makeKeyAndOrderFront, isVisible=\(window.isVisible), isOnActiveSpace=\(window.isOnActiveSpace), isKey=\(window.isKeyWindow)")
+        } else {
+            DispatchQueue.main.async {
+                window.makeKeyAndOrderFront(nil)
+            }
         }
 
         // If our dock position would conflict with our target location then
@@ -496,10 +564,23 @@ class QuickTerminalController: BaseTerminalController {
                 // focus of a non-visible window.
                 self.makeWindowKey(window)
 
-                // If our application is not active, then we grab focus. Its important
-                // we do this AFTER our window is animated in and focused because
-                // otherwise macOS will bring forward another window.
-                if !NSApp.isActive {
+                qtLog("[QT] completion: visible=\(self.visible), isActive=\(NSApp.isActive), isKey=\(window.isKeyWindow), isVisible=\(window.isVisible), floating=\(self.derivedConfig.quickTerminalFloating)")
+
+                // For floating mode (iTerm2 approach): Do NOT activate the app.
+                // QuickTerminalWindow is an NSPanel with .nonactivatingPanel, so it
+                // can be key (receive keyboard input) without the app becoming active.
+                // Keeping NSApp.isActive == false ensures the GlobalEventTap continues
+                // to process the toggle hotkey for subsequent Cmd+Shift+X presses.
+                //
+                // For non-floating mode: activate the app so the window gets proper
+                // focus and keyboard input.
+                if self.derivedConfig.quickTerminalFloating {
+                    // Floating panel: just ensure it's key, don't activate app
+                    qtLog("[QT] completion: floating mode, skipping NSApp.activate, isKey=\(window.isKeyWindow)")
+                    if !window.isKeyWindow {
+                        self.makeWindowKey(window, retries: 10)
+                    }
+                } else if !NSApp.isActive {
                     NSApp.activate(ignoringOtherApps: true)
 
                     // This works around a really funky bug where if the terminal is
@@ -550,6 +631,7 @@ class QuickTerminalController: BaseTerminalController {
     }
 
     private func animateWindowOut(window: NSWindow, to position: QuickTerminalPosition) {
+        qtLog("[QT] animateWindowOut: starting, isOnActiveSpace=\(window.isOnActiveSpace), isActive=\(NSApp.isActive)")
         saveScreenState(exitFullscreen: true)
 
         // If we hid the dock then we unhide it.
@@ -558,6 +640,7 @@ class QuickTerminalController: BaseTerminalController {
         // If the window isn't on our active space then we don't animate, we just
         // hide it.
         if !window.isOnActiveSpace {
+            qtLog("[QT] animateWindowOut: not on active space, orderOut immediately")
             self.previousApp = nil
             window.orderOut(self)
             // If our application is hidden previously, we hide it again
@@ -612,7 +695,13 @@ class QuickTerminalController: BaseTerminalController {
 
         defer { updateColorSchemeForSurfaceTree() }
         // Change the collection behavior of the window depending on the configuration.
-        window.collectionBehavior = derivedConfig.quickTerminalSpaceBehavior.collectionBehavior
+        // For floating mode, use canJoinAllSpaces to ensure the window can reappear
+        // after orderOut() on fullscreen spaces.
+        if derivedConfig.quickTerminalFloating {
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        } else {
+            window.collectionBehavior = derivedConfig.quickTerminalSpaceBehavior.collectionBehavior
+        }
 
         // If our window is not visible, then no need to sync the appearance yet.
         // Some APIs such as window blur have no effect unless the window is visible.
