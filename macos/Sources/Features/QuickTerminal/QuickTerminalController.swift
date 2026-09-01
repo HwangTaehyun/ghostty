@@ -52,6 +52,15 @@ class QuickTerminalController: BaseTerminalController {
     /// Tracks if we're currently handling a manual resize to prevent recursion
     private var isHandlingResize: Bool = false
 
+    /// The display the quick terminal was last shown on, as a `CGDirectDisplayID`. For
+    /// `quick-terminal-screen = main` we reuse this so the terminal stays on the display it
+    /// appeared on instead of jumping to wherever keyboard focus is. Stored by ID (not NSScreen
+    /// instance) so it survives sleep/wake and resolution changes that recreate NSScreen objects.
+    private var lastScreenID: CGDirectDisplayID?
+
+    /// Local key monitor for moving the quick terminal between displays with Cmd+Option+Left/Right.
+    private var moveKeyMonitor: Any?
+
     /// This is set to false by init if the window managed by this controller should not be restorable.
     /// For example, terminals executing custom scripts are not restorable.
     let restorable: Bool
@@ -123,6 +132,9 @@ class QuickTerminalController: BaseTerminalController {
 
         // Make sure we restore our hidden dock
         hiddenDock = nil
+
+        // Remove our display-move key monitor
+        if let moveKeyMonitor { NSEvent.removeMonitor(moveKeyMonitor) }
     }
 
     // MARK: NSWindowController
@@ -130,6 +142,12 @@ class QuickTerminalController: BaseTerminalController {
     override func windowDidLoad() {
         super.windowDidLoad()
         guard let window = self.window else { return }
+
+        // Move the quick terminal between displays with Cmd+Option+Left/Right while it's focused.
+        // A local monitor sees the event before the terminal surface consumes it.
+        moveKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.handleMoveKey(event) ?? event
+        }
 
         // The controller is the window delegate so we can detect events such as
         // window close so we can animate out.
@@ -257,6 +275,11 @@ class QuickTerminalController: BaseTerminalController {
               visible,
               !isHandlingResize else { return }
         guard let screen = window.screen ?? NSScreen.main else { return }
+
+        // By default a manual resize grows/shrinks only the dragged edge (native
+        // behavior). Hold Option while resizing to re-center instead, so both
+        // sides move symmetrically.
+        guard NSEvent.modifierFlags.contains(.option) else { return }
 
         // Prevent recursive loops
         isHandlingResize = true
@@ -470,8 +493,73 @@ class QuickTerminalController: BaseTerminalController {
         }
     }
 
+    /// The `CGDirectDisplayID` of a screen, or nil if unavailable. Used to match the pinned
+    /// display across reconfiguration (sleep/wake, resolution change) where NSScreen instances
+    /// are recreated and pointer identity no longer holds.
+    private func screenID(_ screen: NSScreen) -> CGDirectDisplayID? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+    }
+
+    /// Resolve the screen to show on. For `quick-terminal-screen = main`, stay on the last-shown
+    /// display (matched by ID so it survives sleep/wake) so the terminal doesn't jump as focus
+    /// moves; other modes (`mouse`, `macos-menu-bar`) resolve from config each time as configured.
+    private func resolveScreen() -> NSScreen? {
+        if case .main = derivedConfig.quickTerminalScreen,
+           let id = lastScreenID,
+           let match = NSScreen.screens.first(where: { screenID($0) == id }) {
+            return match
+        }
+        return derivedConfig.quickTerminalScreen.screen
+    }
+
+    /// Cmd+Option+Left/Right moves the quick terminal to the previous/next display while it is
+    /// focused. Consumes the event only when a move actually happens, so on a single-display
+    /// setup the chord still falls through to the terminal instead of being swallowed dead.
+    private func handleMoveKey(_ event: NSEvent) -> NSEvent? {
+        guard visible, let window, window.isKeyWindow else { return event }
+        let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        guard mods == [.command, .option] else { return event }
+        switch event.keyCode {
+        case 123: return moveToScreen(offset: -1) ? nil : event // left arrow
+        case 124: return moveToScreen(offset: +1) ? nil : event // right arrow
+        default: return event
+        }
+    }
+
+    /// Move the quick terminal to the display `offset` positions away (wrapping), keeping its
+    /// current size and configured position. Pins `lastScreenID`, re-evaluates dock hiding for the
+    /// new screen, and animates with the configured duration. Returns false if no move was possible.
+    @discardableResult
+    private func moveToScreen(offset: Int) -> Bool {
+        guard let window, let current = window.screen else { return false }
+        let screens = NSScreen.screens
+        guard screens.count > 1, let idx = screens.firstIndex(of: current) else { return false }
+        let target = screens[(idx + offset + screens.count) % screens.count]
+        lastScreenID = screenID(target)
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = derivedConfig.quickTerminalAnimationDuration
+            context.timingFunction = .init(name: .easeIn)
+            position.setFinal(
+                in: window.animator(),
+                on: target,
+                terminalSize: derivedConfig.quickTerminalSize,
+                closedFrame: window.frame)
+        }
+
+        // Re-evaluate dock hiding for the new screen, matching animateWindowIn.
+        if position.conflictsWithDock(on: target) {
+            if hiddenDock == nil { hiddenDock = .init() }
+            hiddenDock?.hide()
+        } else {
+            hiddenDock = nil
+        }
+        return true
+    }
+
     private func animateWindowIn(window: NSWindow, from position: QuickTerminalPosition) {
-        guard let screen = derivedConfig.quickTerminalScreen.screen else { return }
+        guard let screen = resolveScreen() else { return }
+        lastScreenID = screenID(screen)
 
         // Grab our last closed frame to use from the cache.
         let closedFrame = screenStateCache.frame(for: screen)
