@@ -61,6 +61,11 @@ class QuickTerminalController: BaseTerminalController {
     /// Local key monitor for moving the quick terminal between displays with Cmd+Option+Left/Right.
     private var moveKeyMonitor: Any?
 
+    /// Set when the quick terminal was in (non-native) fullscreen at the moment it was hidden, so the
+    /// next show re-enters fullscreen. We exit fullscreen on hide to keep the saved frame correct,
+    /// then re-enter after the show animation once alphaValue is back to 1 (see animateWindowIn).
+    private var restoreFullscreenOnShow = false
+
     /// This is set to false by init if the window managed by this controller should not be restorable.
     /// For example, terminals executing custom scripts are not restorable.
     let restorable: Bool
@@ -479,8 +484,10 @@ class QuickTerminalController: BaseTerminalController {
 
     func saveScreenState(exitFullscreen: Bool) {
         // If we are in fullscreen, then we exit fullscreen. We do this immediately so
-        // we have th correct window.frame for the save state below.
+        // we have the correct window.frame for the save state below. Remember that we were
+        // fullscreen so the next show re-enters it (see animateWindowIn completion).
         if exitFullscreen, let fullscreenStyle, fullscreenStyle.isFullscreen {
+            restoreFullscreenOnShow = true
             fullscreenStyle.exit()
         }
         guard let window else { return }
@@ -513,15 +520,16 @@ class QuickTerminalController: BaseTerminalController {
     }
 
     /// Cmd+Option+Left/Right moves the quick terminal to the previous/next display while it is
-    /// focused. Consumes the event only when a move actually happens, so on a single-display
-    /// setup the chord still falls through to the terminal instead of being swallowed dead.
+    /// focused. On a single-display setup (nowhere to move) it instead snaps to the left/right
+    /// half of the current screen (Magnet-style). Consumes the event only when it acts.
     private func handleMoveKey(_ event: NSEvent) -> NSEvent? {
         guard visible, let window, window.isKeyWindow else { return event }
         let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
         guard mods == [.command, .option] else { return event }
         switch event.keyCode {
-        case 123: return moveToScreen(offset: -1) ? nil : event // left arrow
-        case 124: return moveToScreen(offset: +1) ? nil : event // right arrow
+        // Try to move to another display first; if there's only one, snap to that half instead.
+        case 123: return (moveToScreen(offset: -1) || snapToHalf(.left)) ? nil : event  // left
+        case 124: return (moveToScreen(offset: +1) || snapToHalf(.right)) ? nil : event // right
         default: return event
         }
     }
@@ -553,6 +561,41 @@ class QuickTerminalController: BaseTerminalController {
             hiddenDock?.hide()
         } else {
             hiddenDock = nil
+        }
+        return true
+    }
+
+    /// Which half of the current screen to snap the quick terminal to.
+    private enum ScreenHalf { case left, right }
+
+    /// On a single-display setup, snap the quick terminal to the left or right half of the current
+    /// screen (Magnet-style). Uses `visibleFrame` so it never overlaps the menu bar or dock. The
+    /// snapped frame is remembered via the normal save-on-hide path. Returns false if no window.
+    @discardableResult
+    private func snapToHalf(_ side: ScreenHalf) -> Bool {
+        guard let window, let screen = window.screen ?? NSScreen.main else { return false }
+
+        // Snapping is an explicit non-fullscreen placement. If the terminal is in (or is remembered
+        // as) fullscreen, leave it and clear that memory — otherwise the fullscreen re-entry on the
+        // next show would override the snapped half (the "returns to full-screen" bug).
+        if let fullscreenStyle, fullscreenStyle.isFullscreen { fullscreenStyle.exit() }
+        restoreFullscreenOnShow = false
+
+        let vf = screen.visibleFrame
+        let halfWidth = (vf.width / 2).rounded(.down)
+        let x = side == .left ? vf.minX : vf.maxX - halfWidth
+        let target = NSRect(x: x, y: vf.minY, width: halfWidth, height: vf.height)
+
+        // The ⌘⌥ chord is still held, so windowDidResize's Option-gated recenter would fire on this
+        // size change and immediately undo the snap. Suppress it until the frame change settles.
+        isHandlingResize = true
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = derivedConfig.quickTerminalAnimationDuration
+            context.timingFunction = .init(name: .easeIn)
+            window.animator().setFrame(target, display: true)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + derivedConfig.quickTerminalAnimationDuration + 0.05) { [weak self] in
+            self?.isHandlingResize = false
         }
         return true
     }
@@ -620,11 +663,31 @@ class QuickTerminalController: BaseTerminalController {
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = derivedConfig.quickTerminalAnimationDuration
             context.timingFunction = .init(name: .easeIn)
-            position.setFinal(
-                in: window.animator(),
-                on: screen,
-                terminalSize: derivedConfig.quickTerminalSize,
-                closedFrame: closedFrame)
+            if let closedFrame {
+                // Restore the exact frame (position AND size) the terminal had when hidden, so a
+                // manual one-sided resize is preserved instead of re-centered. Clamp onto the
+                // visible screen so a stale/off-screen cached origin can never leave the window
+                // off-screen.
+                //
+                // CRITICAL: setInitial set alphaValue = 0 to hide the window before the slide-in,
+                // and setFinal is what restores alphaValue = 1. Since we bypass setFinal here we
+                // MUST restore alpha ourselves — otherwise the window stays fully transparent
+                // (invisible) even though it is on-screen and key, which looked exactly like "the
+                // hotkey only drops focus" (and an alpha=0 window also keeps NSApp.isActive true,
+                // disturbing focus). This omission was the real root cause, not off-screen frames.
+                window.animator().alphaValue = 1
+                let vf = screen.visibleFrame
+                var f = closedFrame
+                f.origin.x = min(max(f.origin.x, vf.minX), max(vf.minX, vf.maxX - f.width))
+                f.origin.y = min(max(f.origin.y, vf.minY), max(vf.minY, vf.maxY - f.height))
+                window.animator().setFrame(f, display: true)
+            } else {
+                position.setFinal(
+                    in: window.animator(),
+                    on: screen,
+                    terminalSize: derivedConfig.quickTerminalSize,
+                    closedFrame: nil)
+            }
         }, completionHandler: {
             // There is a very minor delay here so waiting at least an event loop tick
             // keeps us safe from the view not being on the window.
@@ -651,6 +714,15 @@ class QuickTerminalController: BaseTerminalController {
                 // Once our animation is done, we must grab focus since we can't grab
                 // focus of a non-visible window.
                 self.makeWindowKey(window)
+
+                // If the quick terminal was fullscreen when hidden, re-enter fullscreen now that
+                // it's shown and key. Safe now that the frame restore sets alphaValue = 1 (the
+                // prior "focus만 빠짐" was that omission, not this re-entry). The floating key
+                // check below re-grabs key if the resize drops it.
+                if self.restoreFullscreenOnShow {
+                    self.restoreFullscreenOnShow = false
+                    self.onToggleFullscreen()
+                }
 
                 qtLog("[QT] completion: visible=\(self.visible), isActive=\(NSApp.isActive), isKey=\(window.isKeyWindow), isVisible=\(window.isVisible), floating=\(self.derivedConfig.quickTerminalFloating)")
 
