@@ -66,6 +66,21 @@ class QuickTerminalController: BaseTerminalController {
     /// then re-enter after the show animation once alphaValue is back to 1 (see animateWindowIn).
     private var restoreFullscreenOnShow = false
 
+    /// Monotonic token bumped on every show/hide transition. Async animation completions and
+    /// deferred space-change callbacks capture it and bail if it changed, so a stale callback from
+    /// a superseded transition can't hide, refocus, or resurrect the wrong window generation.
+    private var transitionGeneration = 0
+
+    /// Token bumped on every half-snap so an earlier snap's completion can't clear the shared
+    /// resize suppression while a later snap is still animating.
+    private var snapToken = 0
+
+    /// Which half the quick terminal is currently snapped to, for the staged Cmd+Option+arrow flow:
+    /// the first press snaps to that half; pressing the same direction again (already there) moves to
+    /// the display in that direction. Reset when fullscreen or a manual resize changes the layout.
+    private enum SnapState { case none, left, right }
+    private var snapState: SnapState = .none
+
     /// This is set to false by init if the window managed by this controller should not be restorable.
     /// For example, terminals executing custom scripts are not restorable.
     let restorable: Bool
@@ -217,6 +232,10 @@ class QuickTerminalController: BaseTerminalController {
         // This lets us show alerts without causing the window to disappear.
         guard window?.attachedSheet == nil else { return }
 
+        // Regardless of autohide (and regardless of the grace period below), bring the dock back
+        // when we lose focus so a hidden dock is never stranded by the early return.
+        hiddenDock?.restore()
+
         // In floating mode, ignore resignKey if the window was just shown.
         // On fullscreen spaces, the fullscreen app immediately reclaims focus
         // after makeKeyAndOrderFront, causing a spurious resignKey. We use a
@@ -225,6 +244,17 @@ class QuickTerminalController: BaseTerminalController {
            let animateTime = lastAnimateInTime,
            Date().timeIntervalSince(animateTime) < 1.0 {
             qtLog("[QT] windowDidResignKey: floating grace period, ignoring")
+            // The grace period also swallows a genuine focus loss (clicking away right after
+            // summoning). For autohide, re-check once it elapses: if the panel is still not key,
+            // this was real focus loss (not the fullscreen-space artifact), so hide it.
+            if derivedConfig.quickTerminalAutoHide {
+                let generation = transitionGeneration
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                    guard let self, self.visible, self.transitionGeneration == generation,
+                          let window = self.window, !window.isKeyWindow else { return }
+                    self.animateOut()
+                }
+            }
             return
         }
 
@@ -234,10 +264,6 @@ class QuickTerminalController: BaseTerminalController {
         if NSApp.isActive {
             self.previousApp = nil
         }
-
-        // Regardless of autohide, we always want to bring the dock back
-        // when we lose focus.
-        hiddenDock?.restore()
 
         if derivedConfig.quickTerminalAutoHide {
             switch derivedConfig.quickTerminalSpaceBehavior {
@@ -253,18 +279,22 @@ class QuickTerminalController: BaseTerminalController {
                     animateOut()
                 } else {
                     // We've moved to a different space.
+                    let generation = transitionGeneration
 
                     // If we're fullscreen, we need to exit fullscreen because the visible
                     // bounds may have changed causing a new behavior.
                     if let fullscreenStyle, fullscreenStyle.isFullscreen {
                         fullscreenStyle.exit()
                         DispatchQueue.main.async {
+                            guard self.visible, self.transitionGeneration == generation else { return }
                             self.onToggleFullscreen()
                         }
                     }
 
-                    // Make the window visible again on this space
+                    // Make the window visible again on this space — but only if a later toggle
+                    // hasn't hidden us since (otherwise we'd resurrect a hidden panel).
                     DispatchQueue.main.async {
+                        guard self.visible, self.transitionGeneration == generation else { return }
                         self.window?.makeKeyAndOrderFront(nil)
                     }
 
@@ -280,6 +310,10 @@ class QuickTerminalController: BaseTerminalController {
               visible,
               !isHandlingResize else { return }
         guard let screen = window.screen ?? NSScreen.main else { return }
+
+        // A genuine manual resize (snapToHalf's programmatic resize is guarded by isHandlingResize
+        // above) invalidates the staged snap state.
+        snapState = .none
 
         // By default a manual resize grows/shrinks only the dragged edge (native
         // behavior). Hold Option while resizing to re-center instead, so both
@@ -403,6 +437,7 @@ class QuickTerminalController: BaseTerminalController {
         qtLog("[QT] animateIn: starting, floating=\(derivedConfig.quickTerminalFloating)")
         visible = true
         lastAnimateInTime = Date()
+        transitionGeneration &+= 1
 
         // Notify the change
         NotificationCenter.default.post(
@@ -472,6 +507,7 @@ class QuickTerminalController: BaseTerminalController {
         }
         qtLog("[QT] animateOut: starting")
         visible = false
+        transitionGeneration &+= 1
 
         // Notify the change
         NotificationCenter.default.post(
@@ -519,24 +555,41 @@ class QuickTerminalController: BaseTerminalController {
         return derivedConfig.quickTerminalScreen.screen
     }
 
-    /// Cmd+Option+Left/Right moves the quick terminal to the previous/next display while it is
-    /// focused. On a single-display setup (nowhere to move) it instead snaps to the left/right
-    /// half of the current screen (Magnet-style). Consumes the event only when it acts.
+    /// Cmd+Option+Left/Right: staged snap/move. The first press snaps the quick terminal to that half
+    /// of the current display; pressing the SAME direction again (already snapped there) moves it to
+    /// the display in that direction, arriving fullscreen. On a single display there is nowhere to
+    /// move, so it just stays snapped. Consumes the ⌘⌥ chord regardless so it never leaks to the
+    /// terminal surface.
     private func handleMoveKey(_ event: NSEvent) -> NSEvent? {
         guard visible, let window, window.isKeyWindow else { return event }
         let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
         guard mods == [.command, .option] else { return event }
         switch event.keyCode {
-        // Try to move to another display first; if there's only one, snap to that half instead.
-        case 123: return (moveToScreen(offset: -1) || snapToHalf(.left)) ? nil : event  // left
-        case 124: return (moveToScreen(offset: +1) || snapToHalf(.right)) ? nil : event // right
-        default: return event
+        case 123: // left arrow
+            if snapState == .left {
+                // Already snapped left → move to the display in this direction (fullscreen on arrival).
+                if moveToScreen(offset: -1) { snapState = .none }
+            } else {
+                snapToHalf(.left)
+                snapState = .left
+            }
+            return nil
+        case 124: // right arrow
+            if snapState == .right {
+                if moveToScreen(offset: +1) { snapState = .none }
+            } else {
+                snapToHalf(.right)
+                snapState = .right
+            }
+            return nil
+        default:
+            return event
         }
     }
 
-    /// Move the quick terminal to the display `offset` positions away (wrapping), keeping its
-    /// current size and configured position. Pins `lastScreenID`, re-evaluates dock hiding for the
-    /// new screen, and animates with the configured duration. Returns false if no move was possible.
+    /// Move the quick terminal to the display `offset` positions away (wrapping) and enter fullscreen
+    /// on arrival. Pins `lastScreenID`, exits then re-enters fullscreen cleanly across the move, and
+    /// re-evaluates dock hiding. Returns false if there is only one display (no move possible).
     @discardableResult
     private func moveToScreen(offset: Int) -> Bool {
         guard let window, let current = window.screen else { return false }
@@ -545,7 +598,13 @@ class QuickTerminalController: BaseTerminalController {
         let target = screens[(idx + offset + screens.count) % screens.count]
         lastScreenID = screenID(target)
 
-        NSAnimationContext.runAnimationGroup { context in
+        // Exit any current fullscreen cleanly (the fullscreen object tracks the old display) so we
+        // don't drag a fullscreen-sized window with stale restore state across displays. We then
+        // deliberately re-enter fullscreen on the target in the completion below.
+        if let fullscreenStyle, fullscreenStyle.isFullscreen { fullscreenStyle.exit() }
+        restoreFullscreenOnShow = false
+
+        NSAnimationContext.runAnimationGroup({ context in
             context.duration = derivedConfig.quickTerminalAnimationDuration
             context.timingFunction = .init(name: .easeIn)
             position.setFinal(
@@ -553,7 +612,11 @@ class QuickTerminalController: BaseTerminalController {
                 on: target,
                 terminalSize: derivedConfig.quickTerminalSize,
                 closedFrame: window.frame)
-        }
+        }, completionHandler: { [weak self] in
+            // Arrive fullscreen on the new display (deliberate re-entry on the target).
+            guard let self, self.visible else { return }
+            self.onToggleFullscreen()
+        })
 
         // Re-evaluate dock hiding for the new screen, matching animateWindowIn.
         if position.conflictsWithDock(on: target) {
@@ -587,16 +650,20 @@ class QuickTerminalController: BaseTerminalController {
         let target = NSRect(x: x, y: vf.minY, width: halfWidth, height: vf.height)
 
         // The ⌘⌥ chord is still held, so windowDidResize's Option-gated recenter would fire on this
-        // size change and immediately undo the snap. Suppress it until the frame change settles.
+        // size change and immediately undo the snap. Suppress it until this snap's animation settles.
+        // Token it so that with rapid snaps (key repeat) only the LAST snap's completion clears the
+        // shared suppression — an earlier completion must not re-enable recentering mid-snap.
+        snapToken &+= 1
+        let token = snapToken
         isHandlingResize = true
-        NSAnimationContext.runAnimationGroup { context in
+        NSAnimationContext.runAnimationGroup({ context in
             context.duration = derivedConfig.quickTerminalAnimationDuration
             context.timingFunction = .init(name: .easeIn)
             window.animator().setFrame(target, display: true)
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + derivedConfig.quickTerminalAnimationDuration + 0.05) { [weak self] in
-            self?.isHandlingResize = false
-        }
+        }, completionHandler: { [weak self] in
+            guard let self, self.snapToken == token else { return }
+            self.isHandlingResize = false
+        })
         return true
     }
 
@@ -659,15 +726,19 @@ class QuickTerminalController: BaseTerminalController {
         }
 
         // Run the animation that moves our window into the proper place and makes
-        // it visible.
+        // it visible. Capture the transition token so a completion from a superseded toggle bails.
+        let generation = transitionGeneration
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = derivedConfig.quickTerminalAnimationDuration
             context.timingFunction = .init(name: .easeIn)
-            if let closedFrame {
+            if let closedFrame,
+               closedFrame.origin.x.isFinite, closedFrame.origin.y.isFinite,
+               closedFrame.width.isFinite, closedFrame.height.isFinite,
+               closedFrame.width > 0, closedFrame.height > 0 {
                 // Restore the exact frame (position AND size) the terminal had when hidden, so a
                 // manual one-sided resize is preserved instead of re-centered. Clamp onto the
                 // visible screen so a stale/off-screen cached origin can never leave the window
-                // off-screen.
+                // off-screen. Reject non-finite/non-positive cached rects (fall through to config).
                 //
                 // CRITICAL: setInitial set alphaValue = 0 to hide the window before the slide-in,
                 // and setFinal is what restores alphaValue = 1. Since we bypass setFinal here we
@@ -678,6 +749,11 @@ class QuickTerminalController: BaseTerminalController {
                 window.animator().alphaValue = 1
                 let vf = screen.visibleFrame
                 var f = closedFrame
+                // Cap size to the usable area first: a cached frame can outlast a dock/menu-bar
+                // geometry change that shrank visibleFrame without changing resolution/scale, and
+                // origin clamping alone can't remove that overflow. Then clamp the origin on-screen.
+                f.size.width = min(f.width, vf.width)
+                f.size.height = min(f.height, vf.height)
                 f.origin.x = min(max(f.origin.x, vf.minX), max(vf.minX, vf.maxX - f.width))
                 f.origin.y = min(max(f.origin.y, vf.minY), max(vf.minY, vf.maxY - f.height))
                 window.animator().setFrame(f, display: true)
@@ -692,8 +768,8 @@ class QuickTerminalController: BaseTerminalController {
             // There is a very minor delay here so waiting at least an event loop tick
             // keeps us safe from the view not being on the window.
             DispatchQueue.main.async {
-                // If we canceled our animation clean up some state.
-                guard self.visible else {
+                // If we canceled our animation, or a newer transition superseded us, clean up.
+                guard self.transitionGeneration == generation, self.visible else {
                     self.hiddenDock = nil
                     return
                 }
@@ -792,6 +868,9 @@ class QuickTerminalController: BaseTerminalController {
 
     private func animateWindowOut(window: NSWindow, to position: QuickTerminalPosition) {
         qtLog("[QT] animateWindowOut: starting, isOnActiveSpace=\(window.isOnActiveSpace), isActive=\(NSApp.isActive)")
+        // Capture the transition token so a stale hide completion can't order out a window that a
+        // newer show already brought back.
+        let generation = transitionGeneration
         saveScreenState(exitFullscreen: true)
 
         // If we hid the dock then we unhide it.
@@ -840,6 +919,8 @@ class QuickTerminalController: BaseTerminalController {
                 terminalSize: derivedConfig.quickTerminalSize,
                 closedFrame: window.frame)
         }, completionHandler: {
+            // If a newer transition (e.g. a show) superseded this hide, don't order the window out.
+            guard self.transitionGeneration == generation else { return }
             // This causes the window to be removed from the screen list and macOS
             // handles what should be focused next.
             window.orderOut(self)
@@ -944,6 +1025,9 @@ class QuickTerminalController: BaseTerminalController {
     }
 
     private func onToggleFullscreen() {
+        // Entering/leaving fullscreen means we're no longer in a half-snap, so reset the staged
+        // Cmd+Option+arrow state.
+        snapState = .none
         // We ignore the configured fullscreen style and always use non-native
         // because the way the quick terminal works doesn't support native.
         let mode: FullscreenMode
